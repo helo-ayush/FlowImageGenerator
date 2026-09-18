@@ -81,7 +81,8 @@ PROMPT_SELECTORS = [
 # Candidate selectors for submit / generate action
 SUBMIT_SELECTORS = [
     "button[aria-label='Start generation']",
-    "button[type='submit']",
+    "button.generate-icon-button",
+    "button[type='submit'][aria-label*='generation' i]",
     "button:has-text('Start generation')",
     "button[aria-label*='Generate' i]",
     "button[aria-label*='Submit' i]",
@@ -521,64 +522,68 @@ async def _upload_reference_images(
 ) -> int:
     """
     Uploads up to 3 reference images (Google Flow max ingredient limit) to the prompt box.
+    Handles 'Rights to use this image' agreement modal and commits via 'Add to prompt'.
     """
     valid_paths = [p for p in reference_images if p and os.path.exists(p)][:3]
     if not valid_paths:
         return 0
 
     print(f"[INFO] Attaching {len(valid_paths)} reference image(s) to prompt...")
+    attached_count = 0
     for idx, img_path in enumerate(valid_paths, start=1):
         try:
             add_btn = await page.wait_for_selector(
                 'button[aria-label="Add ingredients to the prompt box"]',
                 state="visible",
-                timeout=5000
+                timeout=8000
             )
             await add_btn.click()
             await page.wait_for_timeout(1000)
 
-            upload_btn = await page.wait_for_selector('button:has-text("Upload media")', timeout=4000)
+            upload_btn = await page.wait_for_selector('button:has-text("Upload media")', timeout=5000)
             if upload_btn:
-                async with page.expect_file_chooser(timeout=7000) as fc_info:
+                async with page.expect_file_chooser(timeout=10000) as fc_info:
                     await upload_btn.click()
                 file_chooser = await fc_info.value
                 await file_chooser.set_files(img_path)
                 print(f"[INFO] Uploaded reference image {idx}: {os.path.basename(img_path)}")
-                # Wait for image to finish uploading (thumbnail appears)
-                await page.wait_for_timeout(3000)
-                # Look for the uploaded thumbnail to confirm upload completed
+
+                # Handle Google Flow's 'Rights to use this image' / 'I agree' modal if displayed
+                try:
+                    agree_btn = await page.wait_for_selector('button:has-text("I agree")', state="visible", timeout=3000)
+                    if agree_btn:
+                        print(f"[INFO] Accepted 'Rights to use this image' policy dialog for image {idx}.")
+                        await agree_btn.click()
+                        await page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+
+                # Wait for 'Add to prompt' button to become visible and enabled
+                add_to_prompt = await page.wait_for_selector(
+                    'button:has-text("Add to prompt"), button.detail-add-to-prompt-btn',
+                    state="visible",
+                    timeout=15000
+                )
+                await add_to_prompt.click()
+                print(f"[INFO] Clicked 'Add to prompt' for reference image {idx}.")
+                await page.wait_for_timeout(1500)
+
+                # Confirm ingredient chip attached in prompt dock
                 try:
                     await page.wait_for_selector(
-                        'img[class*="ingredient"], img[class*="thumbnail"], img[class*="upload"], .ingredient-preview img',
+                        'flow-ingredient-bar, [class*="ingredient-bar"], [class*="chip-container"]',
                         state="visible",
                         timeout=5000
                     )
-                    print(f"[INFO] Reference image {idx} upload confirmed.")
+                    print(f"[INFO] Reference image {idx} confirmed in prompt dock.")
                 except Exception:
-                    print(f"[INFO] Reference image {idx} upload confirmation check timed out; proceeding.")
-                # Dismiss the ingredient overlay menu/backdrop
-                await page.keyboard.press("Escape")
-                await page.wait_for_timeout(600)
+                    pass
+                attached_count += 1
         except Exception as e:
             print(f"[WARNING] Could not attach reference image {img_path}: {e}")
             await page.keyboard.press("Escape")
 
-    # Aggressively dismiss any remaining overlays, backdrops, or dialogs
-    for _ in range(3):
-        backdrops = await page.query_selector_all(".cdk-overlay-backdrop, .cdk-overlay-pane")
-        if backdrops:
-            await page.keyboard.press("Escape")
-            await page.wait_for_timeout(300)
-        else:
-            break
-    # Final click on the page body to ensure focus returns to main content
-    try:
-        await page.click("body", position={"x": 960, "y": 540}, force=True)
-        await page.wait_for_timeout(300)
-    except Exception:
-        pass
-
-    return len(valid_paths)
+    return attached_count
 
 
 def compose_full_prompt(
@@ -679,16 +684,13 @@ async def generate_image(
                     "--disable-quic",
                     "--ignore-certificate-errors",
                 ],
-                "ignore_default_args": [
-                    "--enable-automation",
-                ],
             }
 
             try:
-                browser = await p.chromium.launch(channel="chrome", **launch_kwargs)
+                browser = await p.chromium.launch(**launch_kwargs)
             except Exception:
                 try:
-                    browser = await p.chromium.launch(**launch_kwargs)
+                    browser = await p.chromium.launch(channel="chrome", **launch_kwargs)
                 except Exception as launch_exc:
                     if "playwright install" in str(launch_exc).lower() or "doesn't exist" in str(launch_exc).lower():
                         print("[INFO] Browser executable missing; running playwright install...")
@@ -709,8 +711,6 @@ async def generate_image(
                 }
                 if active_proxy:
                     ctx_kwargs["proxy"] = active_proxy
-                    ctx_kwargs["geolocation"] = {"latitude": 40.7128, "longitude": -74.0060}
-                    ctx_kwargs["permissions"] = ["geolocation"]
                     print(f"[INFO] Routing traffic via proxy: {format_proxy_for_log(active_proxy)}")
                 else:
                     print("[INFO] No proxy configured. Operating in direct network connection mode.")
@@ -753,29 +753,29 @@ async def generate_image(
                     proxy_desc = format_proxy_for_log(active_proxy)
                     print(f"[INFO] Navigating to {flow_url} (Proxy: {proxy_desc}, Attempt {attempt}/{max_attempts})...")
                     try:
-                        resp = await page.goto(flow_url, wait_until="domcontentloaded", timeout=timeout * 1000)
+                        resp = await page.goto(flow_url, timeout=timeout * 1000)
                         if resp and resp.status in [502, 504]:
                             raise ProxyConnectionError(f"Proxy gateway error HTTP {resp.status}")
                     except Exception as nav_err:
                         if is_proxy_network_error(nav_err) or "502" in str(nav_err) or "504" in str(nav_err):
                             raise ProxyConnectionError(f"Proxy network error during navigation: {nav_err}")
+                        print(f"[INFO] Initial navigation encountered {nav_err}; retrying...")
+                        await asyncio.sleep(1)
                         resp = await page.goto(flow_url, timeout=timeout * 1000)
                         if resp and resp.status in [502, 504]:
                             raise ProxyConnectionError(f"Proxy gateway error HTTP {resp.status}")
 
+                    await page.wait_for_timeout(4000)
                     check_session()
 
-                    # Handle landing page if presented
-                    create_btn = await page.query_selector('text="Create with Google Flow", a:has-text("Create with Google Flow"), button:has-text("Create with Google Flow")')
-                    if create_btn and await create_btn.is_visible():
-                        print("[INFO] Google Flow landing page detected. Clicking 'Create with Google Flow'...")
-                        await create_btn.click()
-                        await page.wait_for_timeout(3500)
-                        check_session()
-                        if "project/" in flow_url and "project/" not in page.url and not is_google_signin_url(page.url):
-                            print(f"[INFO] Navigating directly to project workspace: {flow_url}...")
-                            await page.goto(flow_url, wait_until="domcontentloaded", timeout=timeout * 1000)
-                            await page.wait_for_timeout(2000)
+                    # Handle landing page if presented (e.g. redirected to /about)
+                    if "/about" in page.url:
+                        landing_sel = 'a:has-text("Create with Google Flow"), button:has-text("Create with Google Flow"), [role="button"]:has-text("Create with Google Flow")'
+                        create_btn = await page.query_selector(landing_sel)
+                        if create_btn and await create_btn.is_visible():
+                            print("[INFO] Google Flow landing page detected. Clicking 'Create with Google Flow'...")
+                            await create_btn.click()
+                            await page.wait_for_timeout(4000)
                             check_session()
 
                     # 5. Wait for the main prompt input element
@@ -789,10 +789,19 @@ async def generate_image(
                         )
                     except PlaywrightTimeoutError:
                         check_session()
-                        await page.screenshot(path="debug_error.png")
-                        raise TimeoutError(
-                            f"Prompt input element did not appear within {timeout}s at {page.url}."
-                        )
+                        # Fallback check for landing page
+                        create_btn = await page.query_selector('text="Create with Google Flow", a:has-text("Create with Google Flow"), button:has-text("Create with Google Flow")')
+                        if create_btn and await create_btn.is_visible():
+                            print("[INFO] Landing page detected on prompt wait timeout. Clicking 'Create with Google Flow'...")
+                            await create_btn.click()
+                            await page.wait_for_timeout(3000)
+                            await page.goto(flow_url, timeout=timeout * 1000)
+                            prompt_el = await page.wait_for_selector(combined_selector, state="visible", timeout=timeout * 1000)
+                        else:
+                            await page.screenshot(path="debug_error.png")
+                            raise TimeoutError(
+                                f"Prompt input element did not appear within {timeout}s at {page.url}."
+                            )
 
                     # Successfully established page & prompt input
                     break
@@ -838,6 +847,14 @@ async def generate_image(
                 image_strength=image_strength
             )
 
+            # Re-query prompt element fresh, as adding ingredients or settings triggers
+            # causes Google Flow / Angular to re-render the prompt dock
+            prompt_sel = ", ".join(PROMPT_SELECTORS)
+            try:
+                prompt_el = await page.wait_for_selector(prompt_sel, state="visible", timeout=10000)
+            except Exception:
+                pass
+
             print("[INFO] Injecting prompt with human-like keypress delays...")
             try:
                 backdrops = await page.query_selector_all(".cdk-overlay-backdrop")
@@ -847,10 +864,15 @@ async def generate_image(
                         await page.wait_for_timeout(200)
                 await prompt_el.click(timeout=3000)
             except Exception:
-                await page.keyboard.press("Escape")
-                await page.wait_for_timeout(300)
-                await prompt_el.click(force=True)
-            await prompt_el.focus()
+                try:
+                    prompt_el = await page.wait_for_selector(prompt_sel, state="visible", timeout=5000)
+                    await prompt_el.click(force=True)
+                except Exception:
+                    pass
+            try:
+                await prompt_el.focus()
+            except Exception:
+                pass
             await asyncio.sleep(0.3)
 
             await page.keyboard.press("Control+A")
@@ -859,7 +881,7 @@ async def generate_image(
 
             for char in full_prompt:
                 await page.keyboard.type(char)
-                await asyncio.sleep(random.uniform(0.04, 0.09))
+                await asyncio.sleep(random.uniform(0.03, 0.07))
 
             print("[INFO] Prompt injected successfully.")
 
@@ -874,10 +896,11 @@ async def generate_image(
                 try:
                     btn = await page.wait_for_selector(submit_sel, state="visible", timeout=3000)
                     if btn:
-                        for _ in range(10):
+                        for _ in range(15):
+                            classes = (await btn.get_attribute("class")) or ""
                             disabled = await btn.get_attribute("disabled")
                             aria_disabled = await btn.get_attribute("aria-disabled")
-                            if not disabled and aria_disabled != "true":
+                            if not disabled and aria_disabled != "true" and "disabled" not in classes:
                                 break
                             await asyncio.sleep(0.3)
                         try:
@@ -1001,7 +1024,7 @@ async def generate_image(
 
             last_progress = None
             completed_images = []
-            ever_saw_generating = False
+            ever_saw_generating = (stamped_count > 0)
 
             while asyncio.get_event_loop().time() - start_time < render_timeout:
                 check_session()
@@ -1270,6 +1293,14 @@ def parse_args():
         default=0,
         help="Index of proxy to select from Webshare proxy list (default: 0)",
     )
+    parser.add_argument(
+        "--reference-images",
+        "-ref",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Paths to up to 3 reference images for image-to-image conditioning",
+    )
     return parser.parse_args()
 
 
@@ -1283,6 +1314,7 @@ def main():
     print(f"Model        : {args.model}")
     print(f"Aspect Ratio : {args.aspect_ratio}")
     print(f"Outputs      : {args.outputs}")
+    print(f"Ref Images   : {args.reference_images}")
     print(f"Style Preset : {args.style}")
     print(f"Output Path  : {args.output}")
     print(f"Overwrite    : {args.overwrite}")
@@ -1298,6 +1330,7 @@ def main():
                 num_outputs=args.outputs,
                 aspect_ratio=args.aspect_ratio,
                 model_variant=args.model,
+                reference_images=args.reference_images,
                 style_preset=args.style,
                 seed=args.seed,
                 output_path=args.output,
