@@ -997,12 +997,15 @@ async def generate_image(
             print(f"[INFO] Monitoring generation status for prompt: '{prompt[:45]}...'")
             start_time = asyncio.get_event_loop().time()
             render_timeout = max(timeout, 180 if has_refs else 90)
+            min_monitor_seconds = 8  # Don't accept "complete" in the first 8s — prevents grabbing old tiles
 
             last_progress = None
             completed_images = []
+            ever_saw_generating = False
 
             while asyncio.get_event_loop().time() - start_time < render_timeout:
                 check_session()
+                elapsed = asyncio.get_event_loop().time() - start_time
 
                 err = await _check_page_errors()
                 if err:
@@ -1011,45 +1014,36 @@ async def generate_image(
                     raise GenerationFailedError(f"Generation rejected by Google Flow: {err}")
 
                 scan_result = await page.evaluate(
-                    """({taskId, promptPrefix, numOutputs}) => {
+                    """({taskId, promptPrefix}) => {
                         // 1. First look for UUID-tagged containers
                         let containers = document.querySelectorAll(
                             '[data-generation-uuid="' + taskId + '"]'
                         );
 
-                        // 2. Fallback: find any unstamped pending or recently created tiles
+                        // 2. Fallback: find any unstamped tiles that are ACTIVELY generating
+                        //    (have pending indicators, progress bars, or NO completed image)
+                        //    NEVER stamp tiles that already have a completed <img> — those are old generations
                         if (containers.length === 0) {
                             const allContainers = document.querySelectorAll(
                                 'flow-grid-tile-container, [class*="tile-container"], [class*="generation-tile"]'
                             );
                             for (const c of allContainers) {
                                 if (c.hasAttribute('data-generation-uuid')) continue;
+
+                                const completedImg = c.querySelector('img');
+                                const hasCompletedImage = completedImg && completedImg.complete && completedImg.naturalWidth > 200;
+
+                                // Only stamp tiles that are IN-PROGRESS (not already completed)
+                                if (hasCompletedImage) continue;
+
                                 const text = (c.innerText || '').toLowerCase();
                                 const aria = (c.getAttribute('aria-label') || '').toLowerCase();
                                 const hasPending = c.querySelector('flow-pending-tile, [class*="pending"], [class*="loading"], mat-progress-bar, [role="progressbar"]');
                                 const hasProgress = text.match(/\\d{1,3}%/);
+
                                 if (hasPending || hasProgress || text.includes(promptPrefix) || aria.includes(promptPrefix)) {
                                     c.setAttribute('data-generation-uuid', taskId);
                                 }
-                            }
-                            containers = document.querySelectorAll('[data-generation-uuid="' + taskId + '"]');
-                        }
-
-                        // 3. Last resort: if still nothing, find the most recent tiles without a UUID
-                        if (containers.length === 0) {
-                            const allContainers = document.querySelectorAll(
-                                'flow-grid-tile-container, [class*="tile-container"]'
-                            );
-                            const unstamped = [];
-                            for (const c of allContainers) {
-                                if (!c.hasAttribute('data-generation-uuid')) {
-                                    unstamped.push(c);
-                                }
-                            }
-                            // Take the most recent N tiles matching expected output count
-                            const toStamp = unstamped.slice(0, numOutputs || 1);
-                            for (const c of toStamp) {
-                                c.setAttribute('data-generation-uuid', taskId);
                             }
                             containers = document.querySelectorAll('[data-generation-uuid="' + taskId + '"]');
                         }
@@ -1093,14 +1087,34 @@ async def generate_image(
                             images: images
                         };
                     }""",
-                    {"taskId": task_uuid, "promptPrefix": prompt_prefix, "numOutputs": num_outputs}
+                    {"taskId": task_uuid, "promptPrefix": prompt_prefix}
                 )
 
                 if scan_result["isGenerating"] and scan_result["progress"] and scan_result["progress"] != last_progress:
                     last_progress = scan_result["progress"]
+                    ever_saw_generating = True
                     print(f"[INFO] Generation progress: {last_progress}...")
 
+                if scan_result["totalCount"] > 0 and scan_result["isGenerating"]:
+                    ever_saw_generating = True
+
                 if scan_result["totalCount"] > 0 and scan_result["completedCount"] == scan_result["totalCount"]:
+                    # Safety: don't accept instant completions unless we saw generating state first
+                    if elapsed < min_monitor_seconds and not ever_saw_generating:
+                        print(f"[INFO] Potential stale tile detected (completed in {elapsed:.1f}s with no progress). Waiting for real generation...")
+                        # Un-stamp these tiles — they are likely old
+                        await page.evaluate(
+                            """({taskId}) => {
+                                const tagged = document.querySelectorAll('[data-generation-uuid="' + taskId + '"]');
+                                for (const c of tagged) {
+                                    c.removeAttribute('data-generation-uuid');
+                                }
+                            }""",
+                            {"taskId": task_uuid}
+                        )
+                        await asyncio.sleep(1.5)
+                        continue
+
                     completed_images = scan_result["images"]
                     print(f"[INFO] Generation complete! Captured {len(completed_images)} variation(s) for UUID {task_uuid}.")
                     break
