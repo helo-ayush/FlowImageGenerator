@@ -535,7 +535,7 @@ async def _upload_reference_images(
                 timeout=5000
             )
             await add_btn.click()
-            await page.wait_for_timeout(800)
+            await page.wait_for_timeout(1000)
 
             upload_btn = await page.wait_for_selector('button:has-text("Upload media")', timeout=4000)
             if upload_btn:
@@ -544,18 +544,39 @@ async def _upload_reference_images(
                 file_chooser = await fc_info.value
                 await file_chooser.set_files(img_path)
                 print(f"[INFO] Uploaded reference image {idx}: {os.path.basename(img_path)}")
-                await page.wait_for_timeout(2000)
+                # Wait for image to finish uploading (thumbnail appears)
+                await page.wait_for_timeout(3000)
+                # Look for the uploaded thumbnail to confirm upload completed
+                try:
+                    await page.wait_for_selector(
+                        'img[class*="ingredient"], img[class*="thumbnail"], img[class*="upload"], .ingredient-preview img',
+                        state="visible",
+                        timeout=5000
+                    )
+                    print(f"[INFO] Reference image {idx} upload confirmed.")
+                except Exception:
+                    print(f"[INFO] Reference image {idx} upload confirmation check timed out; proceeding.")
                 # Dismiss the ingredient overlay menu/backdrop
                 await page.keyboard.press("Escape")
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(600)
         except Exception as e:
             print(f"[WARNING] Could not attach reference image {img_path}: {e}")
             await page.keyboard.press("Escape")
 
-    # Ensure any remaining overlay dialogs or backdrops are dismissed
-    for _ in range(2):
-        await page.keyboard.press("Escape")
-        await page.wait_for_timeout(250)
+    # Aggressively dismiss any remaining overlays, backdrops, or dialogs
+    for _ in range(3):
+        backdrops = await page.query_selector_all(".cdk-overlay-backdrop, .cdk-overlay-pane")
+        if backdrops:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
+        else:
+            break
+    # Final click on the page body to ensure focus returns to main content
+    try:
+        await page.click("body", position={"x": 960, "y": 540}, force=True)
+        await page.wait_for_timeout(300)
+    except Exception:
+        pass
 
     return len(valid_paths)
 
@@ -908,7 +929,9 @@ async def generate_image(
             # 10. Bind newly spawned pending tiles to task_uuid
             print(f"[INFO] Binding generation batch to UUID: {task_uuid}...")
             stamped_count = 0
-            stamp_deadline = asyncio.get_event_loop().time() + 10
+            has_refs = bool(ref_list)
+            stamp_wait = 15 if has_refs else 10  # reference image jobs take longer to spawn tiles
+            stamp_deadline = asyncio.get_event_loop().time() + stamp_wait
 
             while asyncio.get_event_loop().time() < stamp_deadline:
                 check_session()
@@ -921,11 +944,15 @@ async def generate_image(
                 stamped = await page.evaluate(
                     """({taskId}) => {
                         let count = 0;
-                        const containers = document.querySelectorAll('flow-grid-tile-container');
+                        // Broad selector: match any tile container variant
+                        const containers = document.querySelectorAll(
+                            'flow-grid-tile-container, [class*="tile-container"], [class*="generation-tile"]'
+                        );
                         for (const c of containers) {
-                            const pendingTile = c.querySelector('flow-pending-tile');
+                            const pendingTile = c.querySelector('flow-pending-tile, [class*="pending"], [class*="loading"], mat-progress-bar');
                             const img = c.querySelector('img');
-                            if (pendingTile && !img && !c.hasAttribute('data-generation-uuid')) {
+                            if ((pendingTile || (!img && c.querySelector('[class*="progress"], [role="progressbar"]')))
+                                && !c.hasAttribute('data-generation-uuid')) {
                                 c.setAttribute('data-generation-uuid', taskId);
                                 count++;
                             }
@@ -941,11 +968,14 @@ async def generate_image(
                     stamped_more = await page.evaluate(
                         """({taskId}) => {
                             let count = 0;
-                            const containers = document.querySelectorAll('flow-grid-tile-container');
+                            const containers = document.querySelectorAll(
+                                'flow-grid-tile-container, [class*="tile-container"], [class*="generation-tile"]'
+                            );
                             for (const c of containers) {
-                                const pendingTile = c.querySelector('flow-pending-tile');
+                                const pendingTile = c.querySelector('flow-pending-tile, [class*="pending"], [class*="loading"], mat-progress-bar');
                                 const img = c.querySelector('img');
-                                if (pendingTile && !img && !c.hasAttribute('data-generation-uuid')) {
+                                if ((pendingTile || (!img && c.querySelector('[class*="progress"], [role="progressbar"]')))
+                                    && !c.hasAttribute('data-generation-uuid')) {
                                     c.setAttribute('data-generation-uuid', taskId);
                                     count++;
                                 }
@@ -958,12 +988,15 @@ async def generate_image(
                     print(f"[INFO] Successfully stamped {stamped_count} generation tile(s) with UUID {task_uuid}.")
                     break
 
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(0.5)
+
+            if stamped_count == 0:
+                print(f"[WARNING] No generation tiles found with standard selectors after {stamp_wait}s. Attempting broader fallback scan...")
 
             # 11. Monitor generation status strictly querying [data-generation-uuid="<task_uuid>"]
             print(f"[INFO] Monitoring generation status for prompt: '{prompt[:45]}...'")
             start_time = asyncio.get_event_loop().time()
-            render_timeout = max(timeout, 90)
+            render_timeout = max(timeout, 180 if has_refs else 90)
 
             last_progress = None
             completed_images = []
@@ -978,19 +1011,47 @@ async def generate_image(
                     raise GenerationFailedError(f"Generation rejected by Google Flow: {err}")
 
                 scan_result = await page.evaluate(
-                    """({taskId, promptPrefix}) => {
-                        let containers = document.querySelectorAll('flow-grid-tile-container[data-generation-uuid="' + taskId + '"]');
+                    """({taskId, promptPrefix, numOutputs}) => {
+                        // 1. First look for UUID-tagged containers
+                        let containers = document.querySelectorAll(
+                            '[data-generation-uuid="' + taskId + '"]'
+                        );
 
+                        // 2. Fallback: find any unstamped pending or recently created tiles
                         if (containers.length === 0) {
-                            const allContainers = document.querySelectorAll('flow-grid-tile-container');
+                            const allContainers = document.querySelectorAll(
+                                'flow-grid-tile-container, [class*="tile-container"], [class*="generation-tile"]'
+                            );
                             for (const c of allContainers) {
+                                if (c.hasAttribute('data-generation-uuid')) continue;
                                 const text = (c.innerText || '').toLowerCase();
                                 const aria = (c.getAttribute('aria-label') || '').toLowerCase();
-                                if ((text.includes(promptPrefix) || aria.includes(promptPrefix)) && !c.hasAttribute('data-generation-uuid')) {
+                                const hasPending = c.querySelector('flow-pending-tile, [class*="pending"], [class*="loading"], mat-progress-bar, [role="progressbar"]');
+                                const hasProgress = text.match(/\\d{1,3}%/);
+                                if (hasPending || hasProgress || text.includes(promptPrefix) || aria.includes(promptPrefix)) {
                                     c.setAttribute('data-generation-uuid', taskId);
                                 }
                             }
-                            containers = document.querySelectorAll('flow-grid-tile-container[data-generation-uuid="' + taskId + '"]');
+                            containers = document.querySelectorAll('[data-generation-uuid="' + taskId + '"]');
+                        }
+
+                        // 3. Last resort: if still nothing, find the most recent tiles without a UUID
+                        if (containers.length === 0) {
+                            const allContainers = document.querySelectorAll(
+                                'flow-grid-tile-container, [class*="tile-container"]'
+                            );
+                            const unstamped = [];
+                            for (const c of allContainers) {
+                                if (!c.hasAttribute('data-generation-uuid')) {
+                                    unstamped.push(c);
+                                }
+                            }
+                            // Take the most recent N tiles matching expected output count
+                            const toStamp = unstamped.slice(0, numOutputs || 1);
+                            for (const c of toStamp) {
+                                c.setAttribute('data-generation-uuid', taskId);
+                            }
+                            containers = document.querySelectorAll('[data-generation-uuid="' + taskId + '"]');
                         }
 
                         if (containers.length === 0) {
@@ -1032,7 +1093,7 @@ async def generate_image(
                             images: images
                         };
                     }""",
-                    {"taskId": task_uuid, "promptPrefix": prompt_prefix}
+                    {"taskId": task_uuid, "promptPrefix": prompt_prefix, "numOutputs": num_outputs}
                 )
 
                 if scan_result["isGenerating"] and scan_result["progress"] and scan_result["progress"] != last_progress:
