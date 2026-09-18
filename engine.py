@@ -236,7 +236,7 @@ def get_configured_proxy(proxy_index: int = 0) -> Optional[dict]:
     """
     webshare_list = get_webshare_proxies()
     if webshare_list:
-        env_idx = os.environ.get("WEBSHARE_PROXY_INDEX", "").strip()
+        env_idx = os.environ.get("WEBSHARE_PROXY_INDEX", "").strip().strip("\"'")
         if env_idx.isdigit():
             idx = int(env_idx)
         else:
