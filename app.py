@@ -72,11 +72,11 @@ def ensure_playwright_browsers():
                 raise FileNotFoundError("Chromium executable missing")
         _BROWSER_READY = True
     except Exception:
-        print("[INFO] Installing Playwright Chromium browser binaries for container environment...")
+        print("[INFO] Installing Playwright browser binaries for container environment...")
         try:
-            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+            subprocess.run([sys.executable, "-m", "playwright", "install"], check=True)
             _BROWSER_READY = True
-            print("[INFO] Playwright Chromium installation successful.")
+            print("[INFO] Playwright browser installation successful.")
         except Exception as exc:
             print(f"[WARNING] Playwright install execution error: {exc}")
 
@@ -140,6 +140,8 @@ def run_generation(
     global _REQUEST_COUNTER
     if not prompt or not prompt.strip():
         raise gr.Error("Prompt is required.")
+
+    ensure_playwright_browsers()
 
     # Parse and extract reference image paths
     parsed_image_paths: List[str] = []
