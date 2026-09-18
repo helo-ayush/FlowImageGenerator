@@ -29,6 +29,7 @@ import base64
 import io
 import os
 import random
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -665,7 +666,15 @@ async def generate_image(
             try:
                 browser = await p.chromium.launch(channel="chrome", **launch_kwargs)
             except Exception:
-                browser = await p.chromium.launch(**launch_kwargs)
+                try:
+                    browser = await p.chromium.launch(**launch_kwargs)
+                except Exception as launch_exc:
+                    if "playwright install" in str(launch_exc).lower() or "doesn't exist" in str(launch_exc).lower():
+                        print("[INFO] Browser executable missing; running playwright install...")
+                        subprocess.run([sys.executable, "-m", "playwright", "install"], check=True)
+                        browser = await p.chromium.launch(**launch_kwargs)
+                    else:
+                        raise launch_exc
 
             # 3. Helper to create context with Webshare/Residential proxy & stealth
             async def _init_context_and_page(active_proxy: Optional[dict]) -> tuple[BrowserContext, Page]:
