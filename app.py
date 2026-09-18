@@ -37,6 +37,9 @@ from typing import List, Optional, Union
 from dotenv import load_dotenv
 load_dotenv()
 
+# Explicitly disable Gradio 6 Node.js SSR sidecar to avoid port 7860 collisions
+os.environ["GRADIO_SSR_MODE"] = "false"
+
 import gradio as gr
 import uvicorn
 from fastapi import Body, FastAPI, Request
@@ -236,14 +239,10 @@ async def on_startup():
 @fastapi_app.middleware("http")
 async def security_auth_middleware(request: Request, call_next):
     """
-    Enforces Bearer token authentication on protected endpoints if API_BEARER_TOKEN is set.
-    Health checks (/api/health) and static favicons remain accessible for monitoring probes.
+    Enforces Bearer token authentication strictly on protected generation endpoints if API_BEARER_TOKEN is set.
+    The web UI, health checks (/api/health), static assets, and OpenAPI docs remain publicly accessible.
     """
-    public_paths = ["/api/health", "/favicon.ico"]
-    if request.url.path in public_paths:
-        return await call_next(request)
-
-    if API_BEARER_TOKEN:
+    if API_BEARER_TOKEN and request.url.path == "/api/generate_image":
         auth_header = request.headers.get("Authorization", "")
         token = ""
         if auth_header.lower().startswith("bearer "):
@@ -485,9 +484,9 @@ with gr.Blocks(title="Google Flow Custom API Wrapper") as demo:
     )
 
 # ---------------------------------------------------------------------------
-# 6. Mount Gradio onto FastAPI
+# 6. Mount Gradio onto FastAPI (ssr_mode=False disables Node.js server)
 # ---------------------------------------------------------------------------
-app = gr.mount_gradio_app(fastapi_app, demo, path="/")
+app = gr.mount_gradio_app(fastapi_app, demo, path="/", ssr_mode=False)
 
 # ---------------------------------------------------------------------------
 # 7. Server Execution
