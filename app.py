@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import gradio as gr
+from gradio.routes import App
 import uvicorn
 from fastapi import Body, FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -220,7 +221,7 @@ def run_generation(
 # ---------------------------------------------------------------------------
 API_BEARER_TOKEN = os.environ.get("API_BEARER_TOKEN", "").strip()
 
-fastapi_app = FastAPI(
+fastapi_app = App(
     title="Google Flow Custom API Wrapper",
     description="REST & Gradio API for headless Google Flow image generation",
     version="2.0.0"
@@ -487,15 +488,15 @@ with gr.Blocks(title="Google Flow Custom API Wrapper") as demo:
     )
 
 # ---------------------------------------------------------------------------
-# 6. Mount Gradio onto FastAPI (ssr_mode=False disables Node.js server)
-# ---------------------------------------------------------------------------
-app = gr.mount_gradio_app(fastapi_app, demo, path="/", ssr_mode=False)
-
-# ---------------------------------------------------------------------------
-# 7. Server Execution
+# 6. Server Execution (Native Gradio launch for ZeroGPU compatibility)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     server_port = int(os.environ.get("PORT", "7860"))
     server_name = os.environ.get("HOST", "0.0.0.0")
-    print(f"[INFO] Starting Google Flow Server on {server_name}:{server_port}...")
-    uvicorn.run(app, host=server_name, port=server_port)
+    print(f"[INFO] Starting Google Flow Gradio Server on {server_name}:{server_port}...")
+    demo.queue().launch(
+        _app=fastapi_app,
+        server_name=server_name,
+        server_port=server_port,
+        ssr_mode=False
+    )
