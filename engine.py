@@ -558,6 +558,30 @@ async def _upload_reference_images(
                 except Exception:
                     pass
 
+                fname = os.path.basename(img_path)
+                stem = Path(img_path).stem
+
+                # Critical: In Google Flow's asset drawer, the preview pane defaults to whatever
+                # asset was previously selected (e.g. earlier generations).
+                # We must explicitly find and click the newly uploaded asset row so the preview
+                # switches to our uploaded image BEFORE clicking 'Add to prompt'.
+                target_sel = f'button.asset-item:has-text("{fname}"), button.asset-item:has-text("{stem}")'
+                try:
+                    target_row = await page.wait_for_selector(target_sel, state="visible", timeout=15000)
+                    if target_row:
+                        await target_row.click()
+                        print(f"[INFO] Selected newly uploaded asset item '{fname}' in drawer.")
+                        await page.wait_for_timeout(1000)
+                except Exception:
+                    try:
+                        first_row = await page.wait_for_selector('button.asset-item', state="visible", timeout=5000)
+                        if first_row:
+                            await first_row.click()
+                            print(f"[INFO] Selected top asset item in drawer for image {idx}.")
+                            await page.wait_for_timeout(1000)
+                    except Exception:
+                        pass
+
                 # Wait for 'Add to prompt' button to become visible and enabled
                 add_to_prompt = await page.wait_for_selector(
                     'button:has-text("Add to prompt"), button.detail-add-to-prompt-btn',
@@ -565,7 +589,7 @@ async def _upload_reference_images(
                     timeout=15000
                 )
                 await add_to_prompt.click()
-                print(f"[INFO] Clicked 'Add to prompt' for reference image {idx}.")
+                print(f"[INFO] Clicked 'Add to prompt' for reference image {idx} ({fname}).")
                 await page.wait_for_timeout(1500)
 
                 # Confirm ingredient chip attached in prompt dock
