@@ -30,6 +30,7 @@ import importlib
 import json
 import os
 import shutil
+import threading
 import uuid
 from pathlib import Path
 from typing import List, Optional, Union
@@ -135,20 +136,15 @@ def is_session_active() -> bool:
 # 2. Concurrency Guardrail (Configurable Semaphore)
 # ---------------------------------------------------------------------------
 MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "2"))
-GENERATION_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+GENERATION_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_REQUESTS)
 _REQUEST_COUNTER = 0
 
 
 # ---------------------------------------------------------------------------
-# 3. Core Generation Handler & ZeroGPU Target
+# 3. Core Generation Handler (Decorated with @spaces.GPU for ZeroGPU runtime)
 # ---------------------------------------------------------------------------
 @spaces.GPU(duration=120)
-def _zerogpu_target():
-    """Satisfies Hugging Face ZeroGPU startup scanner validation."""
-    return True
-
-
-async def run_generation(
+def run_generation(
     prompt: str,
     negative_prompt: Optional[str] = None,
     num_outputs: int = 1,
@@ -160,8 +156,8 @@ async def run_generation(
     seed: int = -1,
 ) -> tuple[List[str], str]:
     """
-    Executes the generation pipeline inside an asyncio.Semaphore concurrency guardrail.
-    Distributes requests across Webshare static proxies via proxy_index.
+    Executes the generation pipeline inside a threading.Semaphore concurrency guardrail.
+    Decorated with @spaces.GPU to satisfy Hugging Face Spaces ZeroGPU supervisor.
     """
     global _REQUEST_COUNTER
     if not prompt or not prompt.strip():
@@ -197,24 +193,31 @@ async def run_generation(
     output_target = OUTPUTS_DIR / f"gen_{run_id}.png"
 
     # Controlled concurrency via Semaphore
-    async with GENERATION_SEMAPHORE:
+    with GENERATION_SEMAPHORE:
         try:
             importlib.reload(engine)
-            results = await engine.generate_image(
-                prompt=prompt.strip(),
-                negative_prompt=negative_prompt.strip() if negative_prompt else None,
-                num_outputs=int(num_outputs),
-                aspect_ratio=aspect_ratio,
-                model_variant=model_variant,
-                reference_images=parsed_image_paths,
-                image_strength=float(image_strength),
-                style_preset=style_preset,
-                seed=int(seed) if seed is not None else -1,
-                output_path=str(output_target),
-                headless=True,
-                overwrite=False,
-                proxy_index=worker_idx,
-            )
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                results = loop.run_until_complete(
+                    engine.generate_image(
+                        prompt=prompt.strip(),
+                        negative_prompt=negative_prompt.strip() if negative_prompt else None,
+                        num_outputs=int(num_outputs),
+                        aspect_ratio=aspect_ratio,
+                        model_variant=model_variant,
+                        reference_images=parsed_image_paths,
+                        image_strength=float(image_strength),
+                        style_preset=style_preset,
+                        seed=int(seed) if seed is not None else -1,
+                        output_path=str(output_target),
+                        headless=True,
+                        overwrite=False,
+                        proxy_index=worker_idx,
+                    )
+                )
+            finally:
+                loop.close()
 
             status_msg = f"Generation complete: {len(results)} variation(s) rendered with {model_variant} ({aspect_ratio})."
             return results, status_msg
@@ -310,7 +313,8 @@ async def api_generate_image(payload: GenerateRequest = Body(...)):
     Direct REST POST endpoint for programmatic API integration without gradio_client.
     """
     try:
-        images, status = await run_generation(
+        images, status = await asyncio.to_thread(
+            run_generation,
             prompt=payload.prompt,
             negative_prompt=payload.negative_prompt,
             num_outputs=payload.num_outputs,
