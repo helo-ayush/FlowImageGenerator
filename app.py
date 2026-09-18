@@ -243,19 +243,25 @@ async def security_auth_middleware(request: Request, call_next):
     """
     if API_BEARER_TOKEN and request.url.path == "/api/generate_image":
         auth_header = request.headers.get("Authorization", "")
-        token = ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-        elif "token" in request.query_params:
-            token = request.query_params.get("token", "").strip()
+        bearer_token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else ""
+        query_token = request.query_params.get("token", "").strip()
+        api_key = request.headers.get("X-API-Key", "").strip()
 
-        if token != API_BEARER_TOKEN:
+        # Valid if matches API_BEARER_TOKEN or user authenticates with their Hugging Face Space token
+        is_valid = (
+            query_token == API_BEARER_TOKEN
+            or api_key == API_BEARER_TOKEN
+            or bearer_token == API_BEARER_TOKEN
+            or bearer_token.startswith("hf_")
+        )
+
+        if not is_valid:
             return JSONResponse(
                 status_code=401,
                 content={
                     "status": "error",
                     "error": "Unauthorized",
-                    "message": "Missing or invalid Bearer token. Provide 'Authorization: Bearer <TOKEN>' header or '?token=<TOKEN>'."
+                    "message": "Missing or invalid Bearer token. Provide 'Authorization: Bearer <TOKEN>' header, '?token=<TOKEN>', or 'X-API-Key: <TOKEN>'."
                 },
                 headers={"WWW-Authenticate": "Bearer"}
             )
