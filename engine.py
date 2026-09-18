@@ -708,13 +708,16 @@ async def generate_image(
                     "--disable-quic",
                     "--ignore-certificate-errors",
                 ],
+                "ignore_default_args": [
+                    "--enable-automation",
+                ],
             }
 
             try:
-                browser = await p.chromium.launch(**launch_kwargs)
+                browser = await p.chromium.launch(channel="chrome", **launch_kwargs)
             except Exception:
                 try:
-                    browser = await p.chromium.launch(channel="chrome", **launch_kwargs)
+                    browser = await p.chromium.launch(**launch_kwargs)
                 except Exception as launch_exc:
                     if "playwright install" in str(launch_exc).lower() or "doesn't exist" in str(launch_exc).lower():
                         print("[INFO] Browser executable missing; running playwright install...")
