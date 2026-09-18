@@ -301,12 +301,80 @@ Object.defineProperty(navigator, 'webdriver', {
     get: () => undefined
 });
 
-// 2. Languages
+// 2. Platform alignment with User-Agent (Win32)
+Object.defineProperty(navigator, 'platform', {
+    get: () => 'Win32'
+});
+
+// 3. UserAgentData platform and high-entropy brand emulation
+if (navigator.userAgentData) {
+    Object.defineProperty(navigator.userAgentData, 'platform', {
+        get: () => 'Windows'
+    });
+    try {
+        const origGetHighEntropyValues = navigator.userAgentData.getHighEntropyValues.bind(navigator.userAgentData);
+        navigator.userAgentData.getHighEntropyValues = function(hints) {
+            return origGetHighEntropyValues(hints).then(values => {
+                return {
+                    ...values,
+                    platform: 'Windows',
+                    platformVersion: '10.0.0',
+                    architecture: 'x86',
+                    bitness: '64',
+                    model: '',
+                    brands: [
+                        { brand: 'Chromium', version: '128' },
+                        { brand: 'Google Chrome', version: '128' },
+                        { brand: 'Not;A=Brand', version: '24' }
+                    ]
+                };
+            }).catch(() => ({
+                platform: 'Windows',
+                platformVersion: '10.0.0',
+                architecture: 'x86',
+                bitness: '64',
+                model: '',
+                brands: [
+                    { brand: 'Chromium', version: '128' },
+                    { brand: 'Google Chrome', version: '128' },
+                    { brand: 'Not;A=Brand', version: '24' }
+                ]
+            }));
+        };
+    } catch(e) {}
+}
+
+// 4. Languages
 Object.defineProperty(navigator, 'languages', {
     get: () => ['en-US', 'en']
 });
 
-// 3. Plugins & MimeTypes
+// 5. Hardware Concurrency & Memory
+Object.defineProperty(navigator, 'hardwareConcurrency', {
+    get: () => 8
+});
+Object.defineProperty(navigator, 'deviceMemory', {
+    get: () => 8
+});
+
+// 6. Notification permission emulation
+if (window.Notification) {
+    try {
+        Object.defineProperty(Notification, 'permission', {
+            get: () => 'default'
+        });
+    } catch(e) {}
+}
+
+// 7. Screen & viewport dimensions
+Object.defineProperty(window.screen, 'width', { get: () => 1920 });
+Object.defineProperty(window.screen, 'height', { get: () => 1080 });
+Object.defineProperty(window.screen, 'availWidth', { get: () => 1920 });
+Object.defineProperty(window.screen, 'availHeight', { get: () => 1040 });
+Object.defineProperty(window.screen, 'colorDepth', { get: () => 24 });
+Object.defineProperty(window.screen, 'pixelDepth', { get: () => 24 });
+
+// 8. Plugins & MimeTypes
 const mockPlugins = [
     { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
     { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
@@ -316,26 +384,49 @@ Object.defineProperty(navigator, 'plugins', {
     get: () => mockPlugins
 });
 
-// 4. Chrome object
+// 9. Chrome object with full runtime structures
 window.chrome = {
-    app: { isInstalled: false },
-    runtime: {},
-    loadTimes: () => {},
-    csi: () => {}
+    app: {
+        isInstalled: false,
+        InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+        RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' }
+    },
+    runtime: {
+        OnInstalledReason: {},
+        OnRestartRequiredReason: {},
+        PlatformArch: { X86_64: 'x86-64' },
+        PlatformOs: { WIN: 'win' }
+    },
+    loadTimes: () => ({
+        commitLoadTime: Date.now() / 1000 - 0.5,
+        connectionInfo: 'http/1.1',
+        finishDocumentLoadTime: Date.now() / 1000 - 0.2,
+        finishLoadTime: Date.now() / 1000 - 0.1,
+        firstPaintAfterLoadTime: 0,
+        firstPaintTime: Date.now() / 1000 - 0.3,
+        navigationType: 'Other',
+        npnNegotiatedProtocol: 'unknown',
+        requestTime: Date.now() / 1000 - 1.0,
+        startLoadTime: Date.now() / 1000 - 0.9,
+        wasAlternateProtocolAvailable: false,
+        wasFetchedViaSpdy: false,
+        wasNpnNegotiated: false
+    }),
+    csi: () => ({ startE: Date.now() - 1000, onloadT: Date.now() - 100, pageT: 900, tran: 15 })
 };
 
-// 5. WebGL Vendor & Renderer spoofing
+// 10. WebGL Vendor & Renderer spoofing (matches genuine Intel GPU on Windows)
 const getParameter = WebGLRenderingContext.prototype.getParameter;
 WebGLRenderingContext.prototype.getParameter = function(parameter) {
-    if (parameter === 37445) return 'Intel Inc.';
-    if (parameter === 37446) return 'Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0';
+    if (parameter === 37445) return 'Google Inc. (Intel)';
+    if (parameter === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
     return getParameter.apply(this, arguments);
 };
 if (window.WebGL2RenderingContext) {
     const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
     WebGL2RenderingContext.prototype.getParameter = function(parameter) {
-        if (parameter === 37445) return 'Intel Inc.';
-        if (parameter === 37446) return 'Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0';
+        if (parameter === 37445) return 'Google Inc. (Intel)';
+        if (parameter === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
         return getParameter2.apply(this, arguments);
     };
 }
