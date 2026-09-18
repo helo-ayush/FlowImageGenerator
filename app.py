@@ -166,9 +166,8 @@ def run_generation(
         print(f"[INFO] Capping reference images from {len(parsed_image_paths)} to max allowed 3.")
         parsed_image_paths = parsed_image_paths[:3]
 
-    # Generate unique base path for this run inside outputs directory
     _REQUEST_COUNTER += 1
-    worker_idx = _REQUEST_COUNTER
+    worker_idx = int(os.environ.get("WEBSHARE_PROXY_INDEX", "0"))
     run_id = str(uuid.uuid4())[:8]
     output_target = OUTPUTS_DIR / f"gen_{run_id}.png"
 
