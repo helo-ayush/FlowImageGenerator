@@ -20,10 +20,12 @@ def dummy_gpu():
 
 import asyncio
 import base64
+from datetime import datetime, timezone, timedelta
 import importlib
 import json
 import shutil
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import List, Optional, Union
@@ -85,6 +87,24 @@ def ensure_playwright_browsers():
 # ---------------------------------------------------------------------------
 OUTPUTS_DIR = Path("outputs").resolve()
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+IMAGE_RETENTION_MINUTES = int(os.environ.get("IMAGE_RETENTION_MINUTES", "60"))
+
+async def cleanup_expired_images_loop():
+    """Background task to regularly purge images older than IMAGE_RETENTION_MINUTES."""
+    while True:
+        try:
+            cutoff = time.time() - (IMAGE_RETENTION_MINUTES * 60)
+            if OUTPUTS_DIR.exists():
+                for p in OUTPUTS_DIR.glob("*.png"):
+                    if p.is_file() and p.stat().st_mtime < cutoff:
+                        try:
+                            p.unlink()
+                            print(f"[INFO] Purged expired image: {p.name} (> {IMAGE_RETENTION_MINUTES} min old).")
+                        except Exception:
+                            pass
+        except Exception as exc:
+            print(f"[WARN] Error in image cleanup loop: {exc}")
+        await asyncio.sleep(300)
 
 SESSION_B64 = os.environ.get("SESSION_STORAGE_BASE64")
 if SESSION_B64:
@@ -234,6 +254,7 @@ async def on_startup():
     """Initializes environment tasks in background so server binds to port immediately."""
     print("[INFO] Application startup: verifying container environment...")
     asyncio.create_task(asyncio.to_thread(ensure_playwright_browsers))
+    asyncio.create_task(cleanup_expired_images_loop())
 
 
 @fastapi_app.middleware("http")
@@ -288,24 +309,62 @@ async def api_health():
     active = is_session_active()
     return JSONResponse(
         status_code=200 if active else 503,
-        content={"status": "ok" if active else "unauthenticated", "session_active": active}
+        content={
+            "status": "ok" if active else "unauthenticated",
+            "session_active": active,
+            "retention_minutes": IMAGE_RETENTION_MINUTES
+        }
     )
 
 
 @fastapi_app.get("/api/download")
 async def api_download(file: str):
-    """Allows downloading rendered image assets by filename or path."""
+    """
+    Allows downloading rendered image assets by filename or path.
+    Automatically verifies that the file is within the active IMAGE_RETENTION_MINUTES TTL window.
+    """
     filename = Path(file).name
     target = (OUTPUTS_DIR / filename).resolve()
-    if target.exists() and target.is_file():
-        return FileResponse(str(target), media_type="image/png")
-    return JSONResponse(status_code=404, content={"error": "File not found"})
+    if not target.exists() or not target.is_file():
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "not_found",
+                "error": "File not found",
+                "message": f"The image '{filename}' was not found on the server or has already been expired."
+            }
+        )
+
+    # Check expiration TTL
+    age_seconds = time.time() - target.stat().st_mtime
+    if age_seconds > (IMAGE_RETENTION_MINUTES * 60):
+        try:
+            target.unlink()
+        except Exception:
+            pass
+        return JSONResponse(
+            status_code=410,
+            content={
+                "status": "expired",
+                "error": "Download link expired",
+                "message": f"This download link has expired. Images are retained for {IMAGE_RETENTION_MINUTES} minutes after generation.",
+                "retention_minutes": IMAGE_RETENTION_MINUTES
+            }
+        )
+
+    return FileResponse(str(target), media_type="image/png", filename=filename)
 
 
 @fastapi_app.post("/api/generate_image")
-async def api_generate_image(payload: GenerateRequest = Body(...)):
+async def api_generate_image(request: Request, payload: GenerateRequest = Body(...)):
     """
     Direct REST POST endpoint for programmatic API integration without gradio_client.
+    Returns:
+    - images: Local container paths
+    - download_urls: Fully qualified public download links
+    - relative_urls: Relative download endpoints
+    - images_base64: Raw base64 encoded PNG strings for immediate client usage
+    - expires_at: ISO timestamp when download links will invalidate
     """
     try:
         images, status = await asyncio.to_thread(
@@ -320,6 +379,18 @@ async def api_generate_image(payload: GenerateRequest = Body(...)):
             style_preset=payload.style_preset,
             seed=payload.seed,
         )
+
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or "helo-ayush-imagegeneratorflow.hf.space"
+        proto = request.headers.get("x-forwarded-proto") or "https"
+        if "0.0.0.0" in host or "127.0.0.1" in host or "localhost" in host:
+            origin = "https://helo-ayush-imagegeneratorflow.hf.space"
+        else:
+            origin = f"{proto}://{host}"
+
+        download_urls = [f"{origin}/api/download?file={Path(p).name}" for p in images]
+        relative_urls = [f"/api/download?file={Path(p).name}" for p in images]
+        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=IMAGE_RETENTION_MINUTES)).isoformat()
+
         images_b64 = []
         for p in images:
             try:
@@ -327,11 +398,16 @@ async def api_generate_image(payload: GenerateRequest = Body(...)):
                     images_b64.append(base64.b64encode(f.read()).decode("utf-8"))
             except Exception:
                 pass
+
         return {
             "status": "success",
             "images": images,
+            "download_urls": download_urls,
+            "relative_urls": relative_urls,
             "images_base64": images_b64,
             "count": len(images),
+            "retention_minutes": IMAGE_RETENTION_MINUTES,
+            "expires_at": expires_at,
             "details": status
         }
     except gr.Error as ge:
