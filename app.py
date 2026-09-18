@@ -35,7 +35,7 @@ import gradio as gr
 from gradio.routes import App
 import uvicorn
 from fastapi import Body, FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 import engine
@@ -292,6 +292,16 @@ async def api_health():
     )
 
 
+@fastapi_app.get("/api/download")
+async def api_download(file: str):
+    """Allows downloading rendered image assets by filename or path."""
+    filename = Path(file).name
+    target = (OUTPUTS_DIR / filename).resolve()
+    if target.exists() and target.is_file():
+        return FileResponse(str(target), media_type="image/png")
+    return JSONResponse(status_code=404, content={"error": "File not found"})
+
+
 @fastapi_app.post("/api/generate_image")
 async def api_generate_image(payload: GenerateRequest = Body(...)):
     """
@@ -310,7 +320,20 @@ async def api_generate_image(payload: GenerateRequest = Body(...)):
             style_preset=payload.style_preset,
             seed=payload.seed,
         )
-        return {"status": "success", "images": images, "count": len(images), "details": status}
+        images_b64 = []
+        for p in images:
+            try:
+                with open(p, "rb") as f:
+                    images_b64.append(base64.b64encode(f.read()).decode("utf-8"))
+            except Exception:
+                pass
+        return {
+            "status": "success",
+            "images": images,
+            "images_base64": images_b64,
+            "count": len(images),
+            "details": status
+        }
     except gr.Error as ge:
         return JSONResponse(status_code=400, content={"status": "error", "message": str(ge)})
     except Exception as e:
