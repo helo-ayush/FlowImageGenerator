@@ -62,23 +62,28 @@ import sys
 # ---------------------------------------------------------------------------
 # 0. Container Environment Self-Healing (Playwright Chromium)
 # ---------------------------------------------------------------------------
+_BROWSER_READY = False
+
 def ensure_playwright_browsers():
     """Installs playwright browser binaries if running in a container without pre-installed browsers."""
+    global _BROWSER_READY
+    if _BROWSER_READY:
+        return
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
             executable = p.chromium.executable_path
             if not executable or not os.path.exists(executable):
                 raise FileNotFoundError("Chromium executable missing")
+        _BROWSER_READY = True
     except Exception:
         print("[INFO] Installing Playwright Chromium browser binaries for container environment...")
         try:
             subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+            _BROWSER_READY = True
             print("[INFO] Playwright Chromium installation successful.")
         except Exception as exc:
             print(f"[WARNING] Playwright install execution error: {exc}")
-
-ensure_playwright_browsers()
 
 # ---------------------------------------------------------------------------
 # 1. Startup Session State Hydration
@@ -219,6 +224,13 @@ fastapi_app = FastAPI(
     description="REST & Gradio API for headless Google Flow image generation",
     version="2.0.0"
 )
+
+
+@fastapi_app.on_event("startup")
+async def on_startup():
+    """Initializes environment tasks in background so server binds to port immediately."""
+    print("[INFO] Application startup: verifying container environment...")
+    asyncio.create_task(asyncio.to_thread(ensure_playwright_browsers))
 
 
 @fastapi_app.middleware("http")
