@@ -76,9 +76,9 @@ def ensure_playwright_browsers():
     except Exception:
         print("[INFO] Installing Playwright browser binaries for container environment...")
         try:
-            subprocess.run([sys.executable, "-m", "playwright", "install"], check=True)
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chrome", "chromium"], check=False)
             _BROWSER_READY = True
-            print("[INFO] Playwright browser installation successful.")
+            print("[INFO] Playwright browser installation completed.")
         except Exception as exc:
             print(f"[WARNING] Playwright install execution error: {exc}")
 
