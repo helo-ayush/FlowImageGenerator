@@ -40,6 +40,18 @@ load_dotenv()
 # Explicitly disable Gradio 6 Node.js SSR sidecar to avoid port 7860 collisions
 os.environ["GRADIO_SSR_MODE"] = "false"
 
+try:
+    import spaces
+except ImportError:
+    class spaces:
+        @staticmethod
+        def GPU(func=None, **kwargs):
+            if func is not None:
+                return func
+            def decorator(f):
+                return f
+            return decorator
+
 import gradio as gr
 import uvicorn
 from fastapi import Body, FastAPI, Request
@@ -130,6 +142,7 @@ _REQUEST_COUNTER = 0
 # ---------------------------------------------------------------------------
 # 3. Core Generation Handler
 # ---------------------------------------------------------------------------
+@spaces.GPU(duration=120)
 async def run_generation(
     prompt: str,
     negative_prompt: Optional[str] = None,
