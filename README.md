@@ -18,19 +18,32 @@ Production-grade automated image generation pipeline for **Google Flow** using P
 ## 📁 Repository Structure
 
 ```
-├── requirements.txt         # Python dependencies (playwright, gradio, pillow, fastapi, etc.)
-├── packages.txt             # Debian system packages for Hugging Face Spaces Playwright
-├── .env                     # Runtime configurations (FLOW_URL, STORAGE_STATE_PATH, etc.)
-├── .env.example             # Environment variables template
+├── app.py                   # Production Gradio Web UI & FastAPI server for local & Spaces
+├── engine.py                # Core headless automation engine & generation pipeline (V2)
 ├── login_session.py         # One-time stealth login & session state exporter
-├── engine.py                # Core headless automation engine & CLI test runner (V2)
-├── app.py                   # Production Gradio Web UI & REST API for local & Spaces
-├── verify_secrets.py        # Pre-flight secret validation for container environments
-├── test_client.py           # Verification client demonstrating gradio_client and REST calls
-├── test_suite.py            # Comprehensive test runner validating all core features
 ├── storage_state.json       # Active authenticated Google Flow session state
-├── outputs/                 # Output directory for rendered generation images
-└── README.md                # Setup, API documentation, and deployment guide
+├── .env                     # Runtime configuration (FLOW_URL, PROXY_INDEX, etc.)
+├── .env.example             # Environment variables template
+├── requirements.txt         # Python dependencies
+├── packages.txt             # Debian system packages for container environments
+├── .gitignore               # Git ignore rules
+├── README.md                # Comprehensive documentation & setup guide
+│
+├── backups/                 # Archived account states and historical configurations
+│   ├── storage_state_account1_backup.json
+│   ├── storage_state_account2_backup.json
+│   ├── storage_state_account3_fresh.json
+│   ├── .env.account1.backup
+│   ├── .env.account2.backup
+│   └── .env.account3.backup
+│
+├── tests/                   # Verification and test suites
+│   ├── test_client.py       # API verification client (gradio_client & REST)
+│   ├── test_suite.py        # Comprehensive test runner for all endpoints
+│   └── verify_secrets.py    # Pre-flight secret validation for container environments
+│
+└── outputs/                 # Output directory for rendered generation images
+    └── samples/             # Verified sample generations
 ```
 
 ---
