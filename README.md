@@ -145,7 +145,7 @@ from gradio_client import Client, handle_file
 
 # For Local App: Client("http://127.0.0.1:7860")
 # For Hugging Face Spaces:
-client = Client("your-username/ImageGeneratorFlow", token="hf_your_token")
+client = Client("helo-ayush/ImageGeneratorFlow")
 
 # Text-to-Image
 result = client.predict(

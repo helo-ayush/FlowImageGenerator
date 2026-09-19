@@ -78,17 +78,17 @@ You can supply the token in any of the following three ways:
 
 1. **Standard Header (Recommended):**
    ```http
-   Authorization: Bearer <YOUR_API_BEARER_TOKEN>
+   Authorization: Bearer dev_secret_token_123
    ```
 
 2. **Custom Header:**
    ```http
-   X-API-Key: <YOUR_API_BEARER_TOKEN>
+   X-API-Key: dev_secret_token_123
    ```
 
 3. **URL Query Parameter:**
    ```http
-   POST https://helo-ayush-imagegeneratorflow.hf.space/api/generate_image?token=<YOUR_API_BEARER_TOKEN>
+   POST https://helo-ayush-imagegeneratorflow.hf.space/api/generate_image?token=dev_secret_token_123
    ```
 
 > **Note:** The health check probe (`GET /api/health`), interactive Web UI, and OpenAPI docs (`/docs`) are public and do not require authentication.
@@ -107,7 +107,7 @@ Generates high-resolution images using Google Flow with full control over aspect
 
 #### Request Headers:
 ```http
-Authorization: Bearer <YOUR_API_BEARER_TOKEN>
+Authorization: Bearer dev_secret_token_123
 Content-Type: application/json
 ```
 
