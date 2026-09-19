@@ -1290,6 +1290,14 @@ async def generate_image(
                     f"({img.format}, {img.width}x{img.height}) [Media UUID: {media_id}]"
                 )
 
+            # Auto-persist refreshed session tokens so session never expires
+            try:
+                if context and not session_status.get("expired", False):
+                    await context.storage_state(path=storage_state_path)
+                    print(f"[INFO] Successfully auto-refreshed session tokens to '{storage_state_path}'.")
+            except Exception as refresh_err:
+                pass
+
             return [p[0] for p in saved_paths]
 
     except SessionExpiredError:
@@ -1311,6 +1319,99 @@ async def generate_image(
                 await browser.close()
         except Exception:
             pass
+
+
+async def refresh_session_state(
+    storage_state_path: str = STORAGE_STATE_PATH,
+    flow_url: str = FLOW_URL,
+    proxy_index: int = 0,
+    timeout: int = 35
+) -> bool:
+    """
+    Lightweight keep-alive heartbeat that visits Google Flow, triggers Google's
+    background cookie rotation (SIDRTS / SIDTS), and writes the fresh tokens back to disk.
+    Returns True if session is healthy and refreshed, False if expired.
+    """
+    validate_session_state(storage_state_path)
+    active_proxy = get_configured_proxy(proxy_index)
+
+    async with async_playwright() as p:
+        launch_kwargs = {
+            "headless": True,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-infobars",
+                "--window-size=1920,1080",
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                "--disable-http2",
+                "--disable-quic",
+                "--ignore-certificate-errors",
+            ],
+            "ignore_default_args": [
+                "--enable-automation",
+            ],
+        }
+
+        try:
+            browser = await p.chromium.launch(channel="chrome", **launch_kwargs)
+        except Exception:
+            browser = await p.chromium.launch(**launch_kwargs)
+
+        ctx_kwargs = {
+            "storage_state": storage_state_path,
+            "viewport": {"width": 1920, "height": 1080},
+            "user_agent": DEFAULT_USER_AGENT,
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+            "ignore_https_errors": True,
+        }
+        if active_proxy:
+            ctx_kwargs["proxy"] = active_proxy
+
+        context = await browser.new_context(**ctx_kwargs)
+        page = await context.new_page()
+        await page.add_init_script(STEALTH_INIT_SCRIPT)
+
+        try:
+            print(f"[INFO] Refreshing session state at: {flow_url}...")
+            await page.goto(flow_url, timeout=timeout * 1000)
+            await page.wait_for_timeout(4000)
+
+            if is_google_signin_url(page.url):
+                print(f"[WARN] Session check: Redirected to sign-in ({page.url}).")
+                return False
+
+            if "/about" in page.url:
+                landing_sel = 'a:has-text("Create with Google Flow"), button:has-text("Create with Google Flow"), [role="button"]:has-text("Create with Google Flow")'
+                create_btn = await page.query_selector(landing_sel)
+                if create_btn and await create_btn.is_visible():
+                    await create_btn.click()
+                    await page.wait_for_timeout(3000)
+
+            if is_google_signin_url(page.url):
+                print(f"[WARN] Session check: Redirected to sign-in after SSO click.")
+                return False
+
+            # Auto-save refreshed cookies to disk
+            await context.storage_state(path=storage_state_path)
+            print(f"[INFO] Keep-alive heartbeat: Successfully refreshed and persisted session tokens to '{storage_state_path}'.")
+            return True
+        except Exception as exc:
+            print(f"[WARN] Keep-alive heartbeat error: {exc}")
+            return False
+        finally:
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 
 def parse_args():

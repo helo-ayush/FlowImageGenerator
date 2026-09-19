@@ -249,12 +249,59 @@ fastapi_app = App(
 )
 
 
+AUTO_REFRESH_INTERVAL_HOURS = int(os.environ.get("AUTO_REFRESH_INTERVAL_HOURS", "4"))
+
+async def auto_refresh_session_loop():
+    """
+    Background keep-alive task: periodically refreshes Google Flow cookies in the background
+    so the rolling session tokens (SIDRTS / SIDTS) never expire even during long idle periods.
+    """
+    # Wait 3 minutes after startup before initial background check
+    await asyncio.sleep(180)
+    while True:
+        try:
+            print("[INFO] Keep-alive task: Proactively refreshing Google Flow session tokens...")
+            worker_idx = int(os.environ.get("WEBSHARE_PROXY_INDEX", "0"))
+            success = await engine.refresh_session_state(
+                storage_state_path=STORAGE_STATE_PATH,
+                flow_url=FLOW_URL,
+                proxy_index=worker_idx,
+                timeout=40
+            )
+            if success:
+                print("[INFO] Keep-alive task: Session tokens refreshed and persisted to disk.")
+                hf_token = (
+                    os.environ.get("HF_TOKEN")
+                    or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+                    or os.environ.get("HF_API_TOKEN")
+                )
+                space_id = os.environ.get("SPACE_ID")
+                if hf_token and space_id:
+                    try:
+                        from huggingface_hub import HfApi
+                        api = HfApi(token=hf_token)
+                        with open(STORAGE_STATE_PATH, "rb") as sf:
+                            new_b64 = base64.b64encode(sf.read()).decode("utf-8")
+                        api.add_space_secret(repo_id=space_id, key="SESSION_STORAGE_BASE64", value=new_b64)
+                        print(f"[INFO] Keep-alive task: Auto-updated SESSION_STORAGE_BASE64 secret on Space '{space_id}'.")
+                    except Exception as hf_err:
+                        print(f"[DEBUG] HF Space secret auto-sync skipped: {hf_err}")
+            else:
+                print("[WARN] Keep-alive task: Session refresh failed or redirected to login.")
+        except Exception as exc:
+            print(f"[WARN] Error in auto_refresh_session_loop: {exc}")
+
+        # Sleep for configured interval (default: 4 hours)
+        await asyncio.sleep(AUTO_REFRESH_INTERVAL_HOURS * 3600)
+
+
 @fastapi_app.on_event("startup")
 async def on_startup():
     """Initializes environment tasks in background so server binds to port immediately."""
     print("[INFO] Application startup: verifying container environment...")
     asyncio.create_task(asyncio.to_thread(ensure_playwright_browsers))
     asyncio.create_task(cleanup_expired_images_loop())
+    asyncio.create_task(auto_refresh_session_loop())
 
 
 @fastapi_app.middleware("http")
