@@ -11,7 +11,15 @@ pinned: false
 
 # Google Flow Headless Automation & Gradio Wrapper (V2)
 
-Production-grade automated image generation pipeline for **Google Flow** using Playwright, pre-authenticated session persistence, residential proxy routing, and Gradio/FastAPI for both local environments and Hugging Face Spaces deployments.
+[![GitHub Repository](https://img.shields.io/badge/GitHub-helo--ayush%2FFlowImageGenerator-blue?logo=github)](https://github.com/helo-ayush/FlowImageGenerator)
+[![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-yellow)](https://huggingface.co/spaces/helo-ayush/ImageGeneratorFlow)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Playwright](https://img.shields.io/badge/Playwright-Chromium-green.svg)](https://playwright.dev/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](https://opensource.org/licenses/MIT)
+
+Production-grade automated image generation pipeline for **Google Flow** using Playwright, pre-authenticated session persistence, residential proxy routing, automated token refresh keep-alive, and Gradio/FastAPI for both local environments and Hugging Face Spaces deployments.
+
+> 📖 **Looking for API integration?** Check out the comprehensive [Developer & API Guide](guide.md) for REST schemas, OpenAPI/Swagger docs, and copy-paste code snippets in TypeScript, Python, and cURL.
 
 ---
 
@@ -21,28 +29,21 @@ Production-grade automated image generation pipeline for **Google Flow** using P
 ├── app.py                   # Production Gradio Web UI & FastAPI server for local & Spaces
 ├── engine.py                # Core headless automation engine & generation pipeline (V2)
 ├── login_session.py         # One-time stealth login & session state exporter
-├── storage_state.json       # Active authenticated Google Flow session state
-├── .env                     # Runtime configuration (FLOW_URL, PROXY_INDEX, etc.)
+├── storage_state.json       # Active authenticated Google Flow session state (git-ignored)
+├── .env                     # Runtime configuration (git-ignored)
 ├── .env.example             # Environment variables template
 ├── requirements.txt         # Python dependencies
 ├── packages.txt             # Debian system packages for container environments
 ├── .gitignore               # Git ignore rules
 ├── README.md                # Comprehensive documentation & setup guide
-│
-├── backups/                 # Archived account states and historical configurations
-│   ├── storage_state_account1_backup.json
-│   ├── storage_state_account2_backup.json
-│   ├── storage_state_account3_fresh.json
-│   ├── .env.account1.backup
-│   ├── .env.account2.backup
-│   └── .env.account3.backup
+├── guide.md                 # Public REST API reference & client integration guide
 │
 ├── tests/                   # Verification and test suites
 │   ├── test_client.py       # API verification client (gradio_client & REST)
 │   ├── test_suite.py        # Comprehensive test runner for all endpoints
 │   └── verify_secrets.py    # Pre-flight secret validation for container environments
 │
-└── outputs/                 # Output directory for rendered generation images
+└── outputs/                 # Output directory for rendered generation images (git-ignored)
     └── samples/             # Verified sample generations
 ```
 
@@ -209,7 +210,9 @@ Hugging Face Spaces and cloud datacenters (AWS, GCP) use datacenter IP ranges th
 ```dotenv
 # In .env or Space Secrets:
 WEBSHARE_PROXY_INDEX=0
-WEBSHARE_PROXY_URL=38.154.185.97:6370:username:password
+WEBSHARE_PROXY_URL=http://username:password@p.webshare.io:80
+# or direct static IP format:
+# WEBSHARE_PROXY_URL=185.xxx.xxx.xxx:port:username:password
 ```
 
 ---
