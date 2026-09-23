@@ -6,6 +6,10 @@ storage_state.json
 storage_state_*.json
 *.session.json
 
+# Persistent Chrome profile (contains live cookies, device tokens, localStorage)
+chrome_profile/
+chrome_profile*/
+
 # Local environment variables and secrets
 .env
 .env.local

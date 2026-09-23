@@ -134,9 +134,47 @@ def is_session_active() -> bool:
 # ---------------------------------------------------------------------------
 # 2. Concurrency Guardrail (Configurable Semaphore)
 # ---------------------------------------------------------------------------
-MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "2"))
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "1"))
 GENERATION_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_REQUESTS)
 _REQUEST_COUNTER = 0
+
+
+# ---------------------------------------------------------------------------
+# 2b. Dedicated background event loop that OWNS the persistent Playwright browser.
+#     A persistent browser context is bound to the event loop that created it, so
+#     ALL engine coroutines (generation + keep-alive) must run on this one loop.
+#     We no longer reload the engine module or spin up a fresh loop per request,
+#     which would orphan the shared profile and force Google to re-validate.
+# ---------------------------------------------------------------------------
+_ENGINE_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_ENGINE_LOOP_THREAD: Optional[threading.Thread] = None
+_ENGINE_LOOP_LOCK = threading.Lock()
+
+
+def _run_engine_loop(loop: asyncio.AbstractEventLoop) -> None:
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+def get_engine_loop() -> asyncio.AbstractEventLoop:
+    """Lazily starts (once) the dedicated background loop thread and returns it."""
+    global _ENGINE_LOOP, _ENGINE_LOOP_THREAD
+    with _ENGINE_LOOP_LOCK:
+        if _ENGINE_LOOP is None or _ENGINE_LOOP.is_closed():
+            _ENGINE_LOOP = asyncio.new_event_loop()
+            _ENGINE_LOOP_THREAD = threading.Thread(
+                target=_run_engine_loop, args=(_ENGINE_LOOP,), daemon=True, name="engine-loop"
+            )
+            _ENGINE_LOOP_THREAD.start()
+        return _ENGINE_LOOP
+
+
+def run_on_engine_loop(coro, timeout: Optional[float] = None):
+    """Submits a coroutine to the background engine loop and blocks for its result."""
+    loop = get_engine_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout)
+
 
 
 # ---------------------------------------------------------------------------
@@ -194,29 +232,23 @@ def run_generation(
     # Controlled concurrency via Semaphore
     with GENERATION_SEMAPHORE:
         try:
-            importlib.reload(engine)
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                results = loop.run_until_complete(
-                    engine.generate_image(
-                        prompt=prompt.strip(),
-                        negative_prompt=negative_prompt.strip() if negative_prompt else None,
-                        num_outputs=int(num_outputs),
-                        aspect_ratio=aspect_ratio,
-                        model_variant=model_variant,
-                        reference_images=parsed_image_paths,
-                        image_strength=float(image_strength),
-                        style_preset=style_preset,
-                        seed=int(seed) if seed is not None else -1,
-                        output_path=str(output_target),
-                        headless=True,
-                        overwrite=False,
-                        proxy_index=worker_idx,
-                    )
+            results = run_on_engine_loop(
+                engine.generate_image(
+                    prompt=prompt.strip(),
+                    negative_prompt=negative_prompt.strip() if negative_prompt else None,
+                    num_outputs=int(num_outputs),
+                    aspect_ratio=aspect_ratio,
+                    model_variant=model_variant,
+                    reference_images=parsed_image_paths,
+                    image_strength=float(image_strength),
+                    style_preset=style_preset,
+                    seed=int(seed) if seed is not None else -1,
+                    output_path=str(output_target),
+                    headless=True,
+                    overwrite=False,
+                    proxy_index=worker_idx,
                 )
-            finally:
-                loop.close()
+            )
 
             status_msg = f"Generation complete: {len(results)} variation(s) rendered with {model_variant} ({aspect_ratio})."
             return results, status_msg
@@ -250,6 +282,21 @@ fastapi_app = App(
 
 
 AUTO_REFRESH_INTERVAL_HOURS = int(os.environ.get("AUTO_REFRESH_INTERVAL_HOURS", "4"))
+# Only push the refreshed session to the HF secret every N heartbeats (default 6 ≈ 24h
+# at a 4h interval), because updating the secret restarts the Space and wipes the profile.
+SECRET_SYNC_EVERY = int(os.environ.get("SECRET_SYNC_EVERY", "6"))
+_KEEPALIVE_COUNT = 0
+
+
+def _sync_session_secret(hf_token: str, space_id: str) -> None:
+    """Blocking helper (run via asyncio.to_thread) that pushes fresh cookies to the HF secret."""
+    from huggingface_hub import HfApi
+    api = HfApi(token=hf_token)
+    with open(STORAGE_STATE_PATH, "rb") as sf:
+        new_b64 = base64.b64encode(sf.read()).decode("utf-8")
+    api.add_space_secret(repo_id=space_id, key="SESSION_STORAGE_BASE64", value=new_b64)
+    print(f"[INFO] Keep-alive task: Auto-updated SESSION_STORAGE_BASE64 secret on Space '{space_id}'.")
+
 
 async def auto_refresh_session_loop():
     """
@@ -270,24 +317,26 @@ async def auto_refresh_session_loop():
             )
             if success:
                 print("[INFO] Keep-alive task: Session tokens refreshed and persisted to disk.")
+                # Pushing the SESSION_STORAGE_BASE64 secret RESTARTS the Space, which
+                # wipes the warm persistent profile. Only sync it occasionally (not on
+                # every heartbeat) so we preserve cookies across rebuilds without
+                # constantly throwing away the long-lived device identity.
+                global _KEEPALIVE_COUNT
+                _KEEPALIVE_COUNT += 1
                 hf_token = (
                     os.environ.get("HF_TOKEN")
                     or os.environ.get("HUGGING_FACE_HUB_TOKEN")
                     or os.environ.get("HF_API_TOKEN")
                 )
                 space_id = os.environ.get("SPACE_ID")
-                if hf_token and space_id:
+                if hf_token and space_id and (_KEEPALIVE_COUNT % SECRET_SYNC_EVERY == 0):
                     try:
-                        from huggingface_hub import HfApi
-                        api = HfApi(token=hf_token)
-                        with open(STORAGE_STATE_PATH, "rb") as sf:
-                            new_b64 = base64.b64encode(sf.read()).decode("utf-8")
-                        api.add_space_secret(repo_id=space_id, key="SESSION_STORAGE_BASE64", value=new_b64)
-                        print(f"[INFO] Keep-alive task: Auto-updated SESSION_STORAGE_BASE64 secret on Space '{space_id}'.")
+                        await asyncio.to_thread(_sync_session_secret, hf_token, space_id)
                     except Exception as hf_err:
                         print(f"[DEBUG] HF Space secret auto-sync skipped: {hf_err}")
             else:
                 print("[WARN] Keep-alive task: Session refresh failed or redirected to login.")
+
         except Exception as exc:
             print(f"[WARN] Error in auto_refresh_session_loop: {exc}")
 
@@ -301,7 +350,10 @@ async def on_startup():
     print("[INFO] Application startup: verifying container environment...")
     asyncio.create_task(asyncio.to_thread(ensure_playwright_browsers))
     asyncio.create_task(cleanup_expired_images_loop())
-    asyncio.create_task(auto_refresh_session_loop())
+    # The keep-alive heartbeat must run on the SAME loop that owns the persistent
+    # browser, so schedule it on the dedicated engine loop (not uvicorn's loop).
+    get_engine_loop().create_task(auto_refresh_session_loop())
+
 
 
 @fastapi_app.middleware("http")

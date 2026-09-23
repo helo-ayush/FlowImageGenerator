@@ -27,11 +27,13 @@ import argparse
 import asyncio
 import base64
 import io
+import json
 import os
 import random
 import subprocess
 import sys
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, Union, List
 
@@ -56,6 +58,26 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/128.0.0.0 Safari/537.36"
 )
+
+# On-disk Chrome profile reused for the entire server lifetime. Keeping ONE
+# persistent profile (instead of a fresh ephemeral context per request) stops
+# Google from seeing every call as a brand-new device replaying stolen cookies.
+USER_DATA_DIR = os.getenv("USER_DATA_DIR", str(Path.cwd() / "chrome_profile"))
+
+# Launch args for the persistent profile. NOTE: --disable-http2 / --disable-quic
+# are intentionally omitted: real Chrome negotiates HTTP/2 + QUIC, and forcing
+# HTTP/1.1 makes the TLS/HTTP2 fingerprint diverge from genuine Chrome.
+PERSISTENT_LAUNCH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-infobars",
+    "--window-size=1920,1080",
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--ignore-certificate-errors",
+]
 
 # Style Preset Prompt Modifiers
 STYLE_PRESETS = {
@@ -433,6 +455,148 @@ if (window.WebGL2RenderingContext) {
 """
 
 
+class PersistentBrowser:
+    """
+    Owns a single long-lived Playwright instance + persistent Chrome profile for
+    the whole process lifetime. Every generation and every keep-alive heartbeat
+    reuses this one context (one stable device identity, IP, and TLS fingerprint)
+    instead of spawning a fresh ephemeral context per request.
+
+    All Playwright objects are bound to the event loop that created them, so this
+    must always be driven from ONE loop (see app.py background loop).
+    """
+
+    def __init__(self) -> None:
+        self._pw = None
+        self._context: Optional[BrowserContext] = None
+        self._lock: Optional[asyncio.Lock] = None
+        self._persist_lock: Optional[asyncio.Lock] = None
+
+    def _ensure_locks(self) -> None:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        if self._persist_lock is None:
+            self._persist_lock = asyncio.Lock()
+
+    async def _seed_from_storage_state(self, context: BrowserContext) -> None:
+        """
+        On a cold profile (e.g. fresh HF container), seed cookies from the
+        hydrated storage_state.json so the persistent profile starts authenticated.
+        Does nothing if the profile already carries cookies.
+        """
+        try:
+            existing = await context.cookies()
+            if existing:
+                return
+            if not os.path.exists(STORAGE_STATE_PATH) or os.path.getsize(STORAGE_STATE_PATH) == 0:
+                return
+            with open(STORAGE_STATE_PATH, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            cookies = state.get("cookies", [])
+            if cookies:
+                await context.add_cookies(cookies)
+                print(f"[INFO] Seeded persistent profile with {len(cookies)} cookies from '{STORAGE_STATE_PATH}'.")
+        except Exception as exc:
+            print(f"[WARN] Could not seed cookies from storage_state: {exc}")
+
+    async def get_context(self, headless: bool = True, proxy_index: int = 0) -> BrowserContext:
+        self._ensure_locks()
+        async with self._lock:
+            if self._context is not None:
+                return self._context
+
+            Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
+            self._pw = await async_playwright().start()
+
+            proxy = get_configured_proxy(proxy_index)
+            ctx_kwargs = {
+                "headless": headless,
+                "user_agent": DEFAULT_USER_AGENT,
+                "viewport": {"width": 1920, "height": 1080},
+                "locale": "en-US",
+                "timezone_id": "America/New_York",
+                "ignore_https_errors": True,
+                "args": PERSISTENT_LAUNCH_ARGS,
+                "ignore_default_args": ["--enable-automation"],
+            }
+            if proxy:
+                ctx_kwargs["proxy"] = proxy
+                print(f"[INFO] Persistent profile routing via proxy: {format_proxy_for_log(proxy)}")
+            else:
+                print("[INFO] Persistent profile running in direct connection mode (no proxy).")
+
+            print(f"[INFO] Launching persistent Chrome profile at: {USER_DATA_DIR} (headless={headless})")
+            try:
+                self._context = await self._pw.chromium.launch_persistent_context(
+                    USER_DATA_DIR, channel="chrome", **ctx_kwargs
+                )
+            except Exception:
+                self._context = await self._pw.chromium.launch_persistent_context(
+                    USER_DATA_DIR, **ctx_kwargs
+                )
+
+            # Stealth applies to every page/document created in this context from now on.
+            await self._context.add_init_script(STEALTH_INIT_SCRIPT)
+            await self._seed_from_storage_state(self._context)
+            return self._context
+
+    async def save_state(self, path: str = STORAGE_STATE_PATH) -> None:
+        """Serializes the persistent profile's cookies/storage back to disk (guarded against races)."""
+        self._ensure_locks()
+        if self._context is None:
+            return
+        async with self._persist_lock:
+            try:
+                await self._context.storage_state(path=path)
+            except Exception as exc:
+                print(f"[WARN] Could not persist storage_state to '{path}': {exc}")
+
+    async def shutdown(self) -> None:
+        self._ensure_locks()
+        async with self._lock:
+            try:
+                if self._context is not None:
+                    await self._context.close()
+            except Exception:
+                pass
+            try:
+                if self._pw is not None:
+                    await self._pw.stop()
+            except Exception:
+                pass
+            self._context = None
+            self._pw = None
+
+
+_BROWSER = PersistentBrowser()
+
+
+async def get_shared_context(headless: bool = True, proxy_index: int = 0) -> BrowserContext:
+    """Returns the single shared persistent browser context, creating it on first use."""
+    return await _BROWSER.get_context(headless=headless, proxy_index=proxy_index)
+
+
+async def persist_shared_state(path: str = STORAGE_STATE_PATH) -> None:
+    """Writes the shared profile's refreshed cookies/tokens back to storage_state.json."""
+    await _BROWSER.save_state(path)
+
+
+async def shutdown_browser() -> None:
+    """Gracefully closes the persistent browser (used on server shutdown)."""
+    await _BROWSER.shutdown()
+
+
+@asynccontextmanager
+async def shared_context(headless: bool = True, proxy_index: int = 0):
+    """
+    Context manager that yields the shared persistent context WITHOUT closing it
+    on exit (the profile is owned by PersistentBrowser for the process lifetime).
+    Preserves the existing `async with ... as context:` indentation in callers.
+    """
+    context = await get_shared_context(headless=headless, proxy_index=proxy_index)
+    yield context
+
+
 def validate_session_state(storage_path: str = STORAGE_STATE_PATH) -> None:
     """Verifies that the session state JSON file exists and is non-empty."""
     if not os.path.exists(storage_path) or os.path.getsize(storage_path) == 0:
@@ -777,72 +941,13 @@ async def generate_image(
     print("[INFO] Checking session state...")
     validate_session_state(storage_state_path)
 
-    browser: Optional[Browser] = None
+    page: Optional[Page] = None
     context: Optional[BrowserContext] = None
 
     try:
-        async with async_playwright() as p:
-            # 2. Launch Chromium with anti-detection flags & WebRTC leak prevention
-            print(f"[INFO] Launching Browser (headless={headless})...")
-            launch_kwargs = {
-                "headless": headless,
-                "args": [
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-features=IsolateOrigins,site-per-process",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-infobars",
-                    "--window-size=1920,1080",
-                    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-                    "--disable-http2",
-                    "--disable-quic",
-                    "--ignore-certificate-errors",
-                ],
-                "ignore_default_args": [
-                    "--enable-automation",
-                ],
-            }
-
-            try:
-                browser = await p.chromium.launch(channel="chrome", **launch_kwargs)
-            except Exception:
-                try:
-                    browser = await p.chromium.launch(**launch_kwargs)
-                except Exception as launch_exc:
-                    if "playwright install" in str(launch_exc).lower() or "doesn't exist" in str(launch_exc).lower():
-                        print("[INFO] Browser executable missing; running playwright install...")
-                        subprocess.run([sys.executable, "-m", "playwright", "install"], check=True)
-                        browser = await p.chromium.launch(**launch_kwargs)
-                    else:
-                        raise launch_exc
-
-            # 3. Helper to create context with Webshare/Residential proxy & stealth
-            async def _init_context_and_page(active_proxy: Optional[dict]) -> tuple[BrowserContext, Page]:
-                ctx_kwargs = {
-                    "storage_state": storage_state_path,
-                    "viewport": {"width": 1920, "height": 1080},
-                    "user_agent": DEFAULT_USER_AGENT,
-                    "locale": "en-US",
-                    "timezone_id": "America/New_York",
-                    "ignore_https_errors": True,
-                }
-                if active_proxy:
-                    ctx_kwargs["proxy"] = active_proxy
-                    print(f"[INFO] Routing traffic via proxy: {format_proxy_for_log(active_proxy)}")
-                else:
-                    print("[INFO] No proxy configured. Operating in direct network connection mode.")
-
-                ctx = await browser.new_context(**ctx_kwargs)
-                pg = await ctx.new_page()
-                await pg.add_init_script(STEALTH_INIT_SCRIPT)
-                return ctx, pg
-
-            # 4. Proxy Failover & Initialization Retry Loop
-            webshare_list = get_webshare_proxies()
-            has_proxies = bool(webshare_list) or bool(os.environ.get("SCRAPERAPI_KEY", "").strip())
-            max_attempts = 2 if has_proxies else 1
-            current_proxy_idx = proxy_index
+        async with shared_context(headless=headless, proxy_index=proxy_index) as context:
+            # 2. Reuse the single persistent Chrome profile (one stable device identity)
+            page = await context.new_page()
             prompt_el = None
             session_status = {"expired": False}
 
@@ -851,93 +956,69 @@ async def generate_image(
                     print("SESSION_EXPIRED: Please update storage_state.json")
                     raise SessionExpiredError("SESSION_EXPIRED: Please update storage_state.json")
 
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    if context:
-                        try:
-                            await context.close()
-                        except Exception:
-                            pass
+            def _on_frame_navigated(frame):
+                if frame == page.main_frame and is_google_signin_url(frame.url):
+                    session_status["expired"] = True
 
-                    active_proxy = get_configured_proxy(current_proxy_idx)
-                    context, page = await _init_context_and_page(active_proxy)
+            page.on("framenavigated", _on_frame_navigated)
 
-                    def _on_frame_navigated(frame):
-                        if frame == page.main_frame and is_google_signin_url(frame.url):
-                            session_status["expired"] = True
+            # 3. Navigate to Google Flow. The proxy is pinned for the profile's whole
+            #    lifetime on purpose: rotating IPs mid-session is itself a strong
+            #    Google risk signal, so we no longer do per-request proxy failover.
+            print(f"[INFO] Navigating to {flow_url} on persistent profile...")
+            try:
+                resp = await page.goto(flow_url, timeout=timeout * 1000)
+                if resp and resp.status in [502, 504]:
+                    raise ProxyConnectionError(f"Proxy gateway error HTTP {resp.status}")
+            except ProxyConnectionError:
+                raise
+            except Exception as nav_err:
+                if is_proxy_network_error(nav_err) or "502" in str(nav_err) or "504" in str(nav_err):
+                    sanitized = sanitize_log_message(str(nav_err))
+                    raise ProxyConnectionError(f"Proxy Connection Failed: {sanitized}")
+                print(f"[INFO] Initial navigation encountered {nav_err}; retrying...")
+                await asyncio.sleep(1)
+                resp = await page.goto(flow_url, timeout=timeout * 1000)
+                if resp and resp.status in [502, 504]:
+                    raise ProxyConnectionError(f"Proxy gateway error HTTP {resp.status}")
 
-                    page.on("framenavigated", _on_frame_navigated)
+            await page.wait_for_timeout(4000)
+            check_session()
 
-                    proxy_desc = format_proxy_for_log(active_proxy)
-                    print(f"[INFO] Navigating to {flow_url} (Proxy: {proxy_desc}, Attempt {attempt}/{max_attempts})...")
-                    try:
-                        resp = await page.goto(flow_url, timeout=timeout * 1000)
-                        if resp and resp.status in [502, 504]:
-                            raise ProxyConnectionError(f"Proxy gateway error HTTP {resp.status}")
-                    except Exception as nav_err:
-                        if is_proxy_network_error(nav_err) or "502" in str(nav_err) or "504" in str(nav_err):
-                            raise ProxyConnectionError(f"Proxy network error during navigation: {nav_err}")
-                        print(f"[INFO] Initial navigation encountered {nav_err}; retrying...")
-                        await asyncio.sleep(1)
-                        resp = await page.goto(flow_url, timeout=timeout * 1000)
-                        if resp and resp.status in [502, 504]:
-                            raise ProxyConnectionError(f"Proxy gateway error HTTP {resp.status}")
-
+            # 4. Handle landing page if presented (e.g. redirected to /about)
+            if "/about" in page.url:
+                landing_sel = 'a:has-text("Create with Google Flow"), button:has-text("Create with Google Flow"), [role="button"]:has-text("Create with Google Flow")'
+                create_btn = await page.query_selector(landing_sel)
+                if create_btn and await create_btn.is_visible():
+                    print("[INFO] Google Flow landing page detected. Clicking 'Create with Google Flow'...")
+                    await create_btn.click()
                     await page.wait_for_timeout(4000)
                     check_session()
 
-                    # Handle landing page if presented (e.g. redirected to /about)
-                    if "/about" in page.url:
-                        landing_sel = 'a:has-text("Create with Google Flow"), button:has-text("Create with Google Flow"), [role="button"]:has-text("Create with Google Flow")'
-                        create_btn = await page.query_selector(landing_sel)
-                        if create_btn and await create_btn.is_visible():
-                            print("[INFO] Google Flow landing page detected. Clicking 'Create with Google Flow'...")
-                            await create_btn.click()
-                            await page.wait_for_timeout(4000)
-                            check_session()
-
-                    # 5. Wait for the main prompt input element
-                    print(f"[INFO] Waiting for prompt input element at {page.url}...")
-                    combined_selector = ", ".join(PROMPT_SELECTORS)
-                    try:
-                        prompt_el = await page.wait_for_selector(
-                            combined_selector,
-                            state="visible",
-                            timeout=timeout * 1000,
-                        )
-                    except PlaywrightTimeoutError:
-                        check_session()
-                        # Fallback check for landing page
-                        create_btn = await page.query_selector('text="Create with Google Flow", a:has-text("Create with Google Flow"), button:has-text("Create with Google Flow")')
-                        if create_btn and await create_btn.is_visible():
-                            print("[INFO] Landing page detected on prompt wait timeout. Clicking 'Create with Google Flow'...")
-                            await create_btn.click()
-                            await page.wait_for_timeout(3000)
-                            await page.goto(flow_url, timeout=timeout * 1000)
-                            prompt_el = await page.wait_for_selector(combined_selector, state="visible", timeout=timeout * 1000)
-                        else:
-                            await page.screenshot(path="debug_error.png")
-                            raise TimeoutError(
-                                f"Prompt input element did not appear within {timeout}s at {page.url}."
-                            )
-
-                    # Successfully established page & prompt input
-                    break
-
-                except (ProxyConnectionError, Exception) as exc:
-                    if is_proxy_network_error(exc) and attempt < max_attempts:
-                        current_proxy_idx += 1
-                        if os.environ.get("SCRAPERAPI_KEY", "").strip():
-                            rotate_scraperapi_session_id()
-                        print(f"[WARNING] Proxy failure on attempt {attempt}: {exc}. Retrying with alternate proxy (index {current_proxy_idx})...")
-                        await asyncio.sleep(1.0)
-                        continue
-                    elif is_proxy_network_error(exc):
-                        sanitized = sanitize_log_message(str(exc))
-                        print(f"[ERROR] Proxy connection failed after {attempt} attempts: {sanitized}")
-                        raise ProxyConnectionError(f"Proxy Connection Failed: {sanitized}")
-                    else:
-                        raise
+            # 5. Wait for the main prompt input element
+            print(f"[INFO] Waiting for prompt input element at {page.url}...")
+            combined_selector = ", ".join(PROMPT_SELECTORS)
+            try:
+                prompt_el = await page.wait_for_selector(
+                    combined_selector,
+                    state="visible",
+                    timeout=timeout * 1000,
+                )
+            except PlaywrightTimeoutError:
+                check_session()
+                # Fallback check for landing page
+                create_btn = await page.query_selector('text="Create with Google Flow", a:has-text("Create with Google Flow"), button:has-text("Create with Google Flow")')
+                if create_btn and await create_btn.is_visible():
+                    print("[INFO] Landing page detected on prompt wait timeout. Clicking 'Create with Google Flow'...")
+                    await create_btn.click()
+                    await page.wait_for_timeout(3000)
+                    await page.goto(flow_url, timeout=timeout * 1000)
+                    prompt_el = await page.wait_for_selector(combined_selector, state="visible", timeout=timeout * 1000)
+                else:
+                    await page.screenshot(path="debug_error.png")
+                    raise TimeoutError(
+                        f"Prompt input element did not appear within {timeout}s at {page.url}."
+                    )
 
             # 6. Apply UI Settings (Aspect Ratio, Model Variant, Num Outputs)
             await _apply_ui_settings(
@@ -1290,12 +1371,12 @@ async def generate_image(
                     f"({img.format}, {img.width}x{img.height}) [Media UUID: {media_id}]"
                 )
 
-            # Auto-persist refreshed session tokens so session never expires
+            # Auto-persist refreshed session tokens from the persistent profile
             try:
-                if context and not session_status.get("expired", False):
-                    await context.storage_state(path=storage_state_path)
+                if not session_status.get("expired", False):
+                    await persist_shared_state(storage_state_path)
                     print(f"[INFO] Successfully auto-refreshed session tokens to '{storage_state_path}'.")
-            except Exception as refresh_err:
+            except Exception:
                 pass
 
             return [p[0] for p in saved_paths]
@@ -1309,14 +1390,11 @@ async def generate_image(
         print(f"[ERROR] Automation error: {sanitized}", file=sys.stderr)
         raise
     finally:
+        # Close ONLY this request's page. The persistent context/profile stays alive
+        # for the whole server lifetime so Google keeps seeing one consistent device.
         try:
-            if context:
-                await context.close()
-        except Exception:
-            pass
-        try:
-            if browser:
-                await browser.close()
+            if page:
+                await page.close()
         except Exception:
             pass
 
@@ -1333,85 +1411,46 @@ async def refresh_session_state(
     Returns True if session is healthy and refreshed, False if expired.
     """
     validate_session_state(storage_state_path)
-    active_proxy = get_configured_proxy(proxy_index)
 
-    async with async_playwright() as p:
-        launch_kwargs = {
-            "headless": True,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-infobars",
-                "--window-size=1920,1080",
-                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-                "--disable-http2",
-                "--disable-quic",
-                "--ignore-certificate-errors",
-            ],
-            "ignore_default_args": [
-                "--enable-automation",
-            ],
-        }
+    # Reuse the SAME persistent profile as generation. Spawning a separate browser
+    # for the heartbeat would present Google with a second, mismatched device and
+    # could accelerate invalidation instead of preventing it.
+    context = await get_shared_context(headless=True, proxy_index=proxy_index)
+    page = await context.new_page()
 
-        try:
-            browser = await p.chromium.launch(channel="chrome", **launch_kwargs)
-        except Exception:
-            browser = await p.chromium.launch(**launch_kwargs)
+    try:
+        print(f"[INFO] Keep-alive heartbeat at: {flow_url} (persistent profile)...")
+        await page.goto(flow_url, timeout=timeout * 1000)
+        await page.wait_for_timeout(4000)
 
-        ctx_kwargs = {
-            "storage_state": storage_state_path,
-            "viewport": {"width": 1920, "height": 1080},
-            "user_agent": DEFAULT_USER_AGENT,
-            "locale": "en-US",
-            "timezone_id": "America/New_York",
-            "ignore_https_errors": True,
-        }
-        if active_proxy:
-            ctx_kwargs["proxy"] = active_proxy
-
-        context = await browser.new_context(**ctx_kwargs)
-        page = await context.new_page()
-        await page.add_init_script(STEALTH_INIT_SCRIPT)
-
-        try:
-            print(f"[INFO] Refreshing session state at: {flow_url}...")
-            await page.goto(flow_url, timeout=timeout * 1000)
-            await page.wait_for_timeout(4000)
-
-            if is_google_signin_url(page.url):
-                print(f"[WARN] Session check: Redirected to sign-in ({page.url}).")
-                return False
-
-            if "/about" in page.url:
-                landing_sel = 'a:has-text("Create with Google Flow"), button:has-text("Create with Google Flow"), [role="button"]:has-text("Create with Google Flow")'
-                create_btn = await page.query_selector(landing_sel)
-                if create_btn and await create_btn.is_visible():
-                    await create_btn.click()
-                    await page.wait_for_timeout(3000)
-
-            if is_google_signin_url(page.url):
-                print(f"[WARN] Session check: Redirected to sign-in after SSO click.")
-                return False
-
-            # Auto-save refreshed cookies to disk
-            await context.storage_state(path=storage_state_path)
-            print(f"[INFO] Keep-alive heartbeat: Successfully refreshed and persisted session tokens to '{storage_state_path}'.")
-            return True
-        except Exception as exc:
-            print(f"[WARN] Keep-alive heartbeat error: {exc}")
+        if is_google_signin_url(page.url):
+            print(f"[WARN] Session check: Redirected to sign-in ({page.url}).")
             return False
-        finally:
-            try:
-                await context.close()
-            except Exception:
-                pass
-            try:
-                await browser.close()
-            except Exception:
-                pass
+
+        if "/about" in page.url:
+            landing_sel = 'a:has-text("Create with Google Flow"), button:has-text("Create with Google Flow"), [role="button"]:has-text("Create with Google Flow")'
+            create_btn = await page.query_selector(landing_sel)
+            if create_btn and await create_btn.is_visible():
+                await create_btn.click()
+                await page.wait_for_timeout(3000)
+
+        if is_google_signin_url(page.url):
+            print(f"[WARN] Session check: Redirected to sign-in after SSO click.")
+            return False
+
+        # Auto-save refreshed cookies to disk
+        await persist_shared_state(storage_state_path)
+        print(f"[INFO] Keep-alive heartbeat: Successfully refreshed and persisted session tokens to '{storage_state_path}'.")
+        return True
+    except Exception as exc:
+        print(f"[WARN] Keep-alive heartbeat error: {sanitize_log_message(str(exc))}")
+        return False
+    finally:
+        # Close only the heartbeat page; the persistent context stays alive.
+        try:
+            await page.close()
+        except Exception:
+            pass
 
 
 def parse_args():
