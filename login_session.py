@@ -63,7 +63,8 @@ async def login_and_export():
     async with async_playwright() as p:
         print("[INFO] Launching Google Chrome into the persistent profile (stealth mode)...")
 
-        proxy_cfg = get_configured_proxy(0)
+        use_proxy = "--proxy" in sys.argv
+        proxy_cfg = get_configured_proxy(0) if use_proxy else None
 
         ctx_kwargs = {
             "headless": False,
@@ -77,7 +78,8 @@ async def login_and_export():
             ctx_kwargs["proxy"] = proxy_cfg
             print(f"[INFO] Routing interactive login via proxy: {format_proxy_for_log(proxy_cfg)}")
         else:
-            print("[INFO] No proxy configured. Launching login browser in direct connection mode.")
+            print("[INFO] Direct network connection mode (Fast local internet, no proxy lag).")
+            print("       (To route login through proxy instead, pass: python login_session.py --proxy)")
 
         # Log in INTO the same persistent profile the server reuses, so the cookies,
         # device tokens and browser fingerprint are all issued to one consistent identity.
@@ -92,13 +94,18 @@ async def login_and_export():
         # Full stealth suite (identical to the runtime engine), applied to the next navigation.
         await context.add_init_script(STEALTH_INIT_SCRIPT)
 
+        # Give Chrome a moment to initialize the initial window
+        await asyncio.sleep(0.5)
         page = context.pages[0] if context.pages else await context.new_page()
 
         print(f"[INFO] Navigating to {target_url}...")
-        try:
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-        except Exception as e:
-            print(f"[INFO] Navigation: {e}")
+        for attempt in range(1, 4):
+            try:
+                await page.goto(target_url, wait_until="commit", timeout=45000)
+                break
+            except Exception as e:
+                print(f"[INFO] Initial navigation attempt {attempt}/3 encountered notice: {e}")
+                await asyncio.sleep(1)
 
         print("\n" + "=" * 68)
         print(" ACTION IN THE OPEN CHROME WINDOW:")
